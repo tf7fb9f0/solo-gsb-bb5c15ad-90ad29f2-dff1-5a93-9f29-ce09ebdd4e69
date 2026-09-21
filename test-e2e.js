@@ -236,8 +236,143 @@ async function main() {
   // 13. 操作记录类型完整
   const kinds = new Set(host.snapshot.logs.map((l) => l.kind));
   assert.ok(kinds.has('system'));
-  // 此前记录里应有 talk / queue / presence（清空后只剩 system，但整个过程中曾出现）
-  // 14. 房间不存在
+
+  // ============ 协商换位 ============
+
+  // 14. 三人排队：bob、carol、alice
+  bob2.send({ type: 'request_speak', version: bob2.v });
+  await host.waitFor((c) => c.snapshot.order.length === 1);
+  carol.send({ type: 'request_speak', version: carol.v });
+  await host.waitFor((c) => c.snapshot.order.length === 2);
+  alice.send({ type: 'request_speak', version: alice.v });
+  await host.waitFor((c) => c.snapshot.order.length === 3);
+  assert.deepStrictEqual(host.snapshot.order, [bobId, carolId, aliceId]);
+
+  // 15. carol 邀请 bob 换位：邀请记录双方 id、发起时版本与位置，并随快照广播
+  const vBeforeSwap = carol.v;
+  carol.send({ type: 'swap_request', version: carol.v, targetId: bobId });
+  await host.waitFor((c) => (c.snapshot.swaps || []).length === 1);
+  let sw = host.snapshot.swaps[0];
+  assert.strictEqual(sw.fromId, carolId);
+  assert.strictEqual(sw.toId, bobId);
+  assert.strictEqual(sw.fromPos, 1);
+  assert.strictEqual(sw.toPos, 0);
+  assert.strictEqual(sw.version, vBeforeSwap, '邀请应记录发起时的队列版本');
+  assert.deepStrictEqual(host.snapshot.order, [bobId, carolId, aliceId], '邀请本身不改变队列');
+
+  // 16. 每人同一时刻最多参与一条待处理邀请
+  alice.lastError = null;
+  alice.send({ type: 'swap_request', version: alice.v, targetId: carolId });
+  await alice.waitFor((c) => c.lastError && c.lastError.code === 'SWAP_BUSY');
+  bob2.lastError = null;
+  bob2.send({ type: 'swap_request', version: bob2.v, targetId: aliceId });
+  await bob2.waitFor((c) => c.lastError && c.lastError.code === 'SWAP_BUSY');
+
+  // 17. 非目标方不能接受；目标方拒绝 -> 邀请消失、队列不变
+  alice.lastError = null;
+  alice.send({ type: 'swap_accept', version: alice.v, swapId: sw.id });
+  await alice.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+  bob2.send({ type: 'swap_decline', version: bob2.v, swapId: sw.id });
+  await host.waitFor((c) => c.snapshot.swaps.length === 0);
+  assert.deepStrictEqual(host.snapshot.order, [bobId, carolId, aliceId], '拒绝后队列不变');
+
+  // 18. 目标方接受：服务端重校验位置后原子交换
+  carol.send({ type: 'swap_request', version: carol.v, targetId: bobId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  sw = host.snapshot.swaps[0];
+  bob2.send({ type: 'swap_accept', version: bob2.v, swapId: sw.id });
+  await host.waitFor((c) => c.snapshot.order[0] === carolId);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, bobId, aliceId], '接受后双方位置互换');
+  assert.strictEqual(host.snapshot.swaps.length, 0, '交换完成后邀请关闭');
+
+  // 19. 发起方可撤回邀请
+  alice.send({ type: 'swap_request', version: alice.v, targetId: bobId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  sw = host.snapshot.swaps[0];
+  alice.send({ type: 'swap_cancel', version: alice.v, swapId: sw.id });
+  await host.waitFor((c) => c.snapshot.swaps.length === 0);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, bobId, aliceId], '撤回后队列不变');
+
+  // 20. 任一方取消申请 -> 相关邀请失效并同步原因
+  alice.send({ type: 'swap_request', version: alice.v, targetId: bobId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  bob2.send({ type: 'cancel_speak', version: bob2.v });
+  await host.waitFor((c) => c.snapshot.swaps.length === 0 && c.snapshot.order.length === 2);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, aliceId]);
+  assert.ok(
+    host.snapshot.logs.some((l) => l.kind === 'swap' && /失效/.test(l.text) && /取消/.test(l.text)),
+    '取消申请应使邀请失效并记录原因'
+  );
+
+  // 21. 接受时位置已变化 -> 邀请标记失效、队列保持不变
+  bob2.send({ type: 'request_speak', version: bob2.v });
+  await host.waitFor((c) => c.snapshot.order.length === 3);
+  assert.deepStrictEqual(host.snapshot.order, [carolId, aliceId, bobId]);
+  alice.send({ type: 'swap_request', version: alice.v, targetId: bobId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  sw = host.snapshot.swaps[0];
+  assert.deepStrictEqual([sw.fromPos, sw.toPos], [1, 2]);
+  // 队首 carol（非邀请方）取消申请，alice/bob 位置上移，邀请记录的位置过期
+  carol.send({ type: 'cancel_speak', version: carol.v });
+  await host.waitFor((c) => c.snapshot.order.length === 2);
+  assert.strictEqual(host.snapshot.swaps.length, 1, '第三方取消不影响他人邀请');
+  bob2.send({ type: 'swap_accept', version: bob2.v, swapId: sw.id });
+  await host.waitFor((c) => c.snapshot.swaps.length === 0);
+  assert.deepStrictEqual(host.snapshot.order, [aliceId, bobId], '位置校验失败时队列必须保持不变');
+  assert.ok(
+    host.snapshot.logs.some((l) => l.kind === 'swap' && /失效/.test(l.text)),
+    '位置校验失败应记录失效原因'
+  );
+
+  // 22. 主持人重排 -> 相关邀请失效
+  alice.send({ type: 'swap_request', version: alice.v, targetId: bobId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  host.send({ type: 'reorder', version: host.v, order: [bobId, aliceId] });
+  await host.waitFor((c) => c.snapshot.order[0] === bobId);
+  assert.strictEqual(host.snapshot.swaps.length, 0, '主持人重排后相关邀请应失效');
+
+  // 23. 任一方开始发言 -> 相关邀请失效
+  bob2.send({ type: 'swap_request', version: bob2.v, targetId: aliceId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  host.send({ type: 'start_speaking', version: host.v, participantId: aliceId });
+  await host.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === aliceId);
+  assert.strictEqual(host.snapshot.swaps.length, 0, '一方开始发言后邀请应失效');
+  assert.deepStrictEqual(host.snapshot.order, [bobId]);
+  host.send({ type: 'end_speaking', version: host.v });
+  await host.waitFor((c) => c.snapshot.speaking === null);
+
+  // 24. 任一方被主持人移出队列 -> 相关邀请失效
+  alice.send({ type: 'request_speak', version: alice.v });
+  await host.waitFor((c) => c.snapshot.order.length === 2);
+  bob2.send({ type: 'swap_request', version: bob2.v, targetId: aliceId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  host.send({ type: 'remove', version: host.v, participantId: aliceId });
+  await host.waitFor((c) => c.snapshot.order.length === 1);
+  assert.strictEqual(host.snapshot.swaps.length, 0, '一方被移出队列后邀请应失效');
+
+  // 25. 任一方主动离开 -> 相关邀请失效
+  alice.send({ type: 'request_speak', version: alice.v });
+  await host.waitFor((c) => c.snapshot.order.length === 2);
+  bob2.send({ type: 'swap_request', version: bob2.v, targetId: aliceId });
+  await host.waitFor((c) => c.snapshot.swaps.length === 1);
+  alice.send({ type: 'leave' });
+  await host.waitFor(
+    (c) => c.snapshot.swaps.length === 0 && !c.snapshot.participants.some((p) => p.id === aliceId)
+  );
+  assert.deepStrictEqual(host.snapshot.order, [bobId]);
+
+  // 26. 非法换位目标
+  bob2.lastError = null;
+  bob2.send({ type: 'swap_request', version: bob2.v, targetId: bobId });
+  await bob2.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TARGET');
+  carol.lastError = null;
+  carol.send({ type: 'swap_request', version: carol.v, targetId: bobId });
+  await carol.waitFor((c) => c.lastError && c.lastError.code === 'NOT_QUEUED');
+  bob2.lastError = null;
+  bob2.send({ type: 'swap_request', version: bob2.v, targetId: carolId });
+  await bob2.waitFor((c) => c.lastError && c.lastError.code === 'TARGET_NOT_QUEUED');
+
+  // 27. 房间不存在
   const ghost = new Client();
   await ghost.open();
   ghost.send({ type: 'join', room: '999999', nick: '幽灵' });

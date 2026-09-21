@@ -49,6 +49,13 @@ const els = {
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
   queueCount: $('#queue-count'),
+  swapOutgoing: $('#swap-outgoing'),
+  swapOutgoingText: $('#swap-outgoing-text'),
+  swapIncoming: $('#swap-incoming'),
+  swapIncomingText: $('#swap-incoming-text'),
+  btnSwapWithdraw: $('#btn-swap-withdraw'),
+  btnSwapAccept: $('#btn-swap-accept'),
+  btnSwapDecline: $('#btn-swap-decline'),
   btnRequest: $('#btn-request'),
   btnCancel: $('#btn-cancel'),
   logList: $('#log-list'),
@@ -336,11 +343,40 @@ function handleMessage(msg) {
 }
 
 function applySnapshot(snap) {
+  const prev = state.snapshot;
   state.snapshot = snap;
   state.version = snap.version;
   state.clockOffset = snap.serverTs - Date.now();
   els.versionBadge.textContent = `v${snap.version}`;
+  notifySwapChanges(prev, snap);
   render();
+}
+
+/**
+ * 换位邀请变化反馈：
+ * - 新收到邀请 -> toast 提醒；
+ * - 与我相关的邀请从快照中消失（被接受/拒绝/撤回/失效）-> 提示最新一条换位记录。
+ */
+function notifySwapChanges(prev, next) {
+  if (!prev || !state.me) return;
+  const myId = state.me.id;
+  const involve = (s) => s.fromId === myId || s.toId === myId;
+  const prevMine = new Map((prev.swaps || []).filter(involve).map((s) => [s.id, s]));
+  const nextMine = new Map((next.swaps || []).filter(involve).map((s) => [s.id, s]));
+  const pmap = participantMap(next);
+  const nickOf = (id) => (pmap.get(id) ? pmap.get(id).nick : '对方');
+
+  for (const s of nextMine.values()) {
+    if (!prevMine.has(s.id) && s.toId === myId) {
+      toast(`「${nickOf(s.fromId)}」邀请你交换发言位置`, 'success');
+    }
+  }
+  for (const s of prevMine.values()) {
+    if (!nextMine.has(s.id)) {
+      const last = [...next.logs].reverse().find((l) => l.kind === 'swap');
+      if (last) toast(last.text, 'success');
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +388,7 @@ function render() {
   if (!snap) return;
   renderStage(snap);
   renderQueue(snap);
+  renderSwapPanel(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -411,6 +448,8 @@ function renderQueue(snap) {
       <span class="queue-nick">${escapeHtml(nick)}</span>
       ${state.me && pid === state.me.id ? '<span class="me-tag">我</span>' : ''}
       ${p && !p.online ? '<span class="offline-tag">离线</span>' : ''}
+      ${swapTagHtml(snap, pid)}
+      ${swapButtonHtml(snap, pid)}
       ${isHost ? `
         <button class="btn btn-primary btn-mini" data-act="start" title="请其发言">▶ 开始</button>
         <button class="btn btn-ghost btn-mini" data-act="remove" title="移出队列">✕</button>
@@ -437,6 +476,65 @@ function renderQueue(snap) {
     els.btnCancel.classList.toggle('hidden', !inQueue);
     els.btnRequest.disabled = speaking;
     els.btnRequest.textContent = speaking ? '你正在发言中' : '🙋 申请发言';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 协商换位：状态渲染
+// ---------------------------------------------------------------------------
+
+/** 某参与者当前参与的待处理邀请（无则 null） */
+function swapOf(snap, pid) {
+  return (snap.swaps || []).find((s) => s.fromId === pid || s.toId === pid) || null;
+}
+
+/** 队列条目上的换位状态标签（所有人可见） */
+function swapTagHtml(snap, pid) {
+  const me = state.me;
+  const s = swapOf(snap, pid);
+  if (!s) return '';
+  if (me && !me.host && me.id === pid) return ''; // 自己的状态在下方卡片展示
+  if (me && !me.host && s.fromId === me.id) return '<span class="swap-tag">⇄ 已邀请</span>';
+  if (me && !me.host && s.toId === me.id) return '<span class="swap-tag swap-tag-in">⇄ 邀请你换位</span>';
+  return '<span class="swap-tag swap-tag-busy">⇄ 换位协商中</span>';
+}
+
+/** 队列条目上的「⇄ 换位」按钮（仅排队中的参与者、双方均无待处理邀请时） */
+function swapButtonHtml(snap, pid) {
+  const me = state.me;
+  if (!me || me.host || pid === me.id) return '';
+  if (!snap.order.includes(me.id)) return ''; // 我不在队列中
+  if (swapOf(snap, me.id) || swapOf(snap, pid)) return ''; // 任一方已有待处理邀请
+  return '<button class="btn btn-ghost btn-mini" data-act="swap" title="邀请对方交换队列位置">⇄ 换位</button>';
+}
+
+/** 队列下方的「我发起的 / 我收到的」邀请卡片 */
+function renderSwapPanel(snap) {
+  const me = state.me;
+  const outgoing = me && !me.host ? (snap.swaps || []).find((s) => s.fromId === me.id) : null;
+  const incoming = me && !me.host ? (snap.swaps || []).find((s) => s.toId === me.id) : null;
+  const pmap = participantMap(snap);
+  const nickOf = (id) => (pmap.get(id) ? pmap.get(id).nick : '已离开');
+  const posOf = (id) => {
+    const idx = snap.order.indexOf(id);
+    return idx === -1 ? '?' : idx + 1;
+  };
+
+  els.swapOutgoing.classList.toggle('hidden', !outgoing);
+  if (outgoing) {
+    els.swapOutgoingText.innerHTML =
+      `📤 已邀请「<b>${escapeHtml(nickOf(outgoing.toId))}</b>」交换位置` +
+      `（你的第 ${posOf(outgoing.fromId)} 位 ↔ 对方第 ${posOf(outgoing.toId)} 位），等待对方回应`;
+    els.btnSwapWithdraw.dataset.swapId = outgoing.id;
+  }
+
+  els.swapIncoming.classList.toggle('hidden', !incoming);
+  if (incoming) {
+    els.swapIncomingText.innerHTML =
+      `📥 「<b>${escapeHtml(nickOf(incoming.fromId))}</b>」邀请你交换位置` +
+      `（你的第 ${posOf(incoming.toId)} 位 ↔ 对方第 ${posOf(incoming.fromId)} 位）`;
+    els.btnSwapAccept.dataset.swapId = incoming.id;
+    els.btnSwapDecline.dataset.swapId = incoming.id;
   }
 }
 
@@ -499,7 +597,7 @@ els.btnClearLogs.addEventListener('click', () => {
   sendCmd({ type: 'clear_logs' });
 });
 
-// 队列条目：开始发言 / 移出
+// 队列条目：开始发言 / 移出 / 发起换位
 els.queueList.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
@@ -509,7 +607,25 @@ els.queueList.addEventListener('click', (e) => {
     sendCmd({ type: 'start_speaking', participantId: pid });
   } else if (btn.dataset.act === 'remove') {
     sendCmd({ type: 'remove', participantId: pid });
+  } else if (btn.dataset.act === 'swap') {
+    sendCmd({ type: 'swap_request', targetId: pid });
   }
+});
+
+// 换位邀请卡片：撤回 / 接受 / 拒绝
+els.btnSwapWithdraw.addEventListener('click', () => {
+  const swapId = els.btnSwapWithdraw.dataset.swapId;
+  if (swapId) sendCmd({ type: 'swap_cancel', swapId });
+});
+
+els.btnSwapAccept.addEventListener('click', () => {
+  const swapId = els.btnSwapAccept.dataset.swapId;
+  if (swapId) sendCmd({ type: 'swap_accept', swapId });
+});
+
+els.btnSwapDecline.addEventListener('click', () => {
+  const swapId = els.btnSwapDecline.dataset.swapId;
+  if (swapId) sendCmd({ type: 'swap_decline', swapId });
 });
 
 // ---------------------------------------------------------------------------

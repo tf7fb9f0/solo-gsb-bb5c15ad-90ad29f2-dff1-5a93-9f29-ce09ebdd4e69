@@ -76,9 +76,24 @@
         <div class="panel-title">
           发言队列 <span class="count" id="queue-count">0</span>
           <span class="hint host-only" id="reorder-hint">（拖动调整顺序）</span>
+          <span class="hint participant-only" id="swap-hint">（排队后可与队友协商换位）</span>
         </div>
         <ul class="queue-list" id="queue-list"></ul>
         <div class="queue-empty" id="queue-empty">队列为空，等待申请发言</div>
+        <!-- 协商换位：我发起的 / 我收到的 -->
+        <div class="swap-panel participant-only">
+          <div class="swap-card hidden" id="swap-outgoing">
+            <span class="swap-text" id="swap-outgoing-text"></span>
+            <button class="btn btn-ghost btn-mini" id="btn-swap-withdraw" type="button">撤回邀请</button>
+          </div>
+          <div class="swap-card swap-card-in hidden" id="swap-incoming">
+            <span class="swap-text" id="swap-incoming-text"></span>
+            <div class="swap-actions">
+              <button class="btn btn-primary btn-mini" id="btn-swap-accept" type="button">接受换位</button>
+              <button class="btn btn-ghost btn-mini" id="btn-swap-decline" type="button">拒绝</button>
+            </div>
+          </div>
+        </div>
         <div class="queue-actions participant-only">
           <button class="btn btn-primary btn-lg" id="btn-request" type="button">🙋 申请发言</button>
           <button class="btn btn-secondary btn-lg hidden" id="btn-cancel" type="button">取消申请</button>

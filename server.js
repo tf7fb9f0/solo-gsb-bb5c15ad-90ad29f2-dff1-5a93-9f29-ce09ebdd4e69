@@ -15,6 +15,14 @@
  *   { type: "remove",         version, participantId }  // 主持人
  *   { type: "clear",          version }                 // 主持人：一键清空
  *   { type: "clear_logs",     version }                 // 主持人：仅清空操作记录
+ *   { type: "swap_request",   version, targetId }       // 排队者：向另一排队者发起换位邀请
+ *   { type: "swap_cancel",    version, swapId }         // 发起方：撤回邀请
+ *   { type: "swap_accept",    version, swapId }         // 目标方：接受（服务端重校验位置后原子交换）
+ *   { type: "swap_decline",   version, swapId }         // 目标方：拒绝
+ *
+ * 换位邀请（snapshot.swaps[]）：记录双方 participantId、发起时的队列版本
+ * 与双方位置；每人同一时刻最多参与一条待处理邀请。任一方取消申请、开始
+ * 发言、被移除、主动离开或主持人重排时，相关邀请失效并记录原因。
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -57,6 +65,7 @@ app.use(express.static(path.join(__dirname, 'public')));
  *   participants: Map<id, {id, nick, joinedAt, online, ws?}>,
  *   order: [id],             // 排队顺序
  *   speaking: { id, startedAt, elapsedMs } | null,
+ *   swaps: Map<id, {id, fromId, toId, fromPos, toPos, version, createdAt}>, // 待处理换位邀请
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
  * }
@@ -72,6 +81,7 @@ function newRoom(code) {
     participants: new Map(),
     order: [],
     speaking: null,
+    swaps: new Map(),
     logs: [],
     createdAt: Date.now(),
     lastSeen: Date.now()
@@ -108,6 +118,42 @@ function uniqueNick(room, nick) {
   return name + crypto.randomBytes(2).toString('hex');
 }
 
+// ---------------------------------------------------------------------------
+// 换位邀请：失效清理
+// ---------------------------------------------------------------------------
+
+/** 让某条换位邀请失效并记录原因（原因会随快照广播给全员） */
+function invalidateSwap(room, swap, reason) {
+  if (!room.swaps.delete(swap.id)) return;
+  const fromNick = room.participants.get(swap.fromId)?.nick ?? '已离开';
+  const toNick = room.participants.get(swap.toId)?.nick ?? '已离开';
+  addLog(room, 'swap', `「${fromNick}」与「${toNick}」的换位邀请失效（${reason}）`);
+}
+
+/** 清理与某参与者相关的全部待处理邀请 */
+function invalidateSwapsFor(room, pid, reason) {
+  for (const s of [...room.swaps.values()]) {
+    if (s.fromId === pid || s.toId === pid) invalidateSwap(room, s, reason);
+  }
+}
+
+/** 清理位置记录已与实际队列不符的邀请（如主持人重排后） */
+function sweepStaleSwaps(room, reason) {
+  for (const s of [...room.swaps.values()]) {
+    if (room.order[s.fromPos] !== s.fromId || room.order[s.toPos] !== s.toId) {
+      invalidateSwap(room, s, reason);
+    }
+  }
+}
+
+/** 某人当前参与的待处理邀请（每人同一时刻最多一条） */
+function pendingSwapOf(room, pid) {
+  for (const s of room.swaps.values()) {
+    if (s.fromId === pid || s.toId === pid) return s;
+  }
+  return null;
+}
+
 /**
  * 构建快照。服务端时钟随快照下发（serverTs），
  * 客户端据此修正时钟偏差计算发言时长。
@@ -132,6 +178,15 @@ function buildSnapshot(room) {
       nick: p.nick,
       online: p.online,
       joinedAt: p.joinedAt
+    })),
+    swaps: [...room.swaps.values()].map((s) => ({
+      id: s.id,
+      fromId: s.fromId,
+      toId: s.toId,
+      fromPos: s.fromPos,
+      toPos: s.toPos,
+      version: s.version,
+      createdAt: s.createdAt
     })),
     logs: room.logs.slice(-200)
   };
@@ -237,6 +292,10 @@ wss.on('connection', (ws) => {
         case 'remove':
         case 'clear':
         case 'clear_logs':
+        case 'swap_request':
+        case 'swap_cancel':
+        case 'swap_accept':
+        case 'swap_decline':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -408,6 +467,7 @@ function handleLeave(room, id, reason) {
     room.speaking = null;
   }
   if (queuedIdx !== -1) room.order.splice(queuedIdx, 1);
+  invalidateSwapsFor(room, id, `「${nick}」离开房间`);
   room.participants.delete(id);
   addLog(room, 'presence', `「${nick}」离开房间`);
   commit(room);
@@ -470,6 +530,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
         return sendError(ws, '你不在发言队列中', 'NOT_QUEUED', room);
       }
       room.order.splice(idx, 1);
+      invalidateSwapsFor(room, pid, `「${me.nick}」取消了发言申请`);
       addLog(room, 'queue', `「${me.nick}」取消发言`);
       return commit(room);
     }
@@ -487,6 +548,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       }
       const idx = room.order.indexOf(targetId);
       if (idx !== -1) room.order.splice(idx, 1);
+      invalidateSwapsFor(room, targetId, `「${target.nick}」开始发言`);
       room.speaking = { id: targetId, startedAt: Date.now() };
       addLog(room, 'talk', `主持人请「${target.nick}」开始发言`);
       return commit(room);
@@ -519,6 +581,8 @@ function handleCommand(ws, msg, room, pid, isHost) {
       const same = incoming.length === room.order.length && incoming.every((id, i) => id === room.order[i]);
       if (same) return sendError(ws, '顺序没有变化', 'NO_CHANGE', room);
       room.order = incoming;
+      // 重排后位置记录失效的邀请立即清理并同步原因
+      sweepStaleSwaps(room, '主持人调整了发言顺序');
       addLog(room, 'queue', '主持人调整了发言顺序');
       return commit(room);
     }
@@ -531,6 +595,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       const idx = room.order.indexOf(targetId);
       if (idx !== -1) room.order.splice(idx, 1);
       if (room.speaking?.id === targetId) room.speaking = null;
+      invalidateSwapsFor(room, targetId, `「${target.nick}」被移出队列`);
       addLog(room, 'queue', `主持人将「${target.nick}」移出队列`);
       return commit(room);
     }
@@ -539,6 +604,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       room.order = [];
       room.speaking = null;
+      room.swaps.clear();
       room.logs = [];
       addLog(room, 'system', '主持人执行了一键清空（队列、当前发言、操作记录已重置）');
       return commit(room);
@@ -548,6 +614,104 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       room.logs = [];
       addLog(room, 'system', '主持人清空了操作记录');
+      return commit(room);
+    }
+
+    // -----------------------------------------------------------------
+    // 协商换位
+    // -----------------------------------------------------------------
+
+    case 'swap_request': {
+      if (!guardVersion(ws, msg, room)) return;
+      const targetId = String(msg.targetId || '');
+      if (targetId === pid) {
+        return sendError(ws, '不能与自己交换位置', 'BAD_TARGET', room);
+      }
+      const target = room.participants.get(targetId);
+      if (!target) return sendError(ws, '参与者不存在', 'NO_PARTICIPANT', room);
+      const fromPos = room.order.indexOf(pid);
+      if (fromPos === -1) {
+        return sendError(ws, '你不在发言队列中，无法发起换位', 'NOT_QUEUED', room);
+      }
+      const toPos = room.order.indexOf(targetId);
+      if (toPos === -1) {
+        return sendError(ws, '对方不在发言队列中', 'TARGET_NOT_QUEUED', room);
+      }
+      if (pendingSwapOf(room, pid)) {
+        return sendError(ws, '你已有一条待处理的换位邀请，请先撤回或等待结果', 'SWAP_BUSY', room);
+      }
+      if (pendingSwapOf(room, targetId)) {
+        return sendError(ws, '对方已有待处理的换位邀请，稍后再试', 'SWAP_BUSY', room);
+      }
+      const swap = {
+        id: genId('sw_'),
+        fromId: pid,
+        toId: targetId,
+        fromPos,
+        toPos,
+        version: room.version, // 发起时的队列版本
+        createdAt: Date.now()
+      };
+      room.swaps.set(swap.id, swap);
+      addLog(
+        room,
+        'swap',
+        `「${me.nick}」邀请「${target.nick}」交换发言位置（第 ${fromPos + 1} ↔ 第 ${toPos + 1} 位）`
+      );
+      return commit(room);
+    }
+
+    case 'swap_cancel': {
+      if (!guardVersion(ws, msg, room)) return;
+      const swap = room.swaps.get(String(msg.swapId || ''));
+      if (!swap) return sendError(ws, '换位邀请不存在或已失效', 'NO_SWAP', room);
+      if (swap.fromId !== pid) {
+        return sendError(ws, '只有发起人可以撤回换位邀请', 'FORBIDDEN', room);
+      }
+      room.swaps.delete(swap.id);
+      const toNick = room.participants.get(swap.toId)?.nick ?? '已离开';
+      addLog(room, 'swap', `「${me.nick}」撤回了对「${toNick}」的换位邀请`);
+      return commit(room);
+    }
+
+    case 'swap_decline': {
+      if (!guardVersion(ws, msg, room)) return;
+      const swap = room.swaps.get(String(msg.swapId || ''));
+      if (!swap) return sendError(ws, '换位邀请不存在或已失效', 'NO_SWAP', room);
+      if (swap.toId !== pid) {
+        return sendError(ws, '只有被邀请人可以拒绝换位邀请', 'FORBIDDEN', room);
+      }
+      room.swaps.delete(swap.id);
+      const fromNick = room.participants.get(swap.fromId)?.nick ?? '已离开';
+      addLog(room, 'swap', `「${me.nick}」拒绝了「${fromNick}」的换位邀请`);
+      return commit(room);
+    }
+
+    case 'swap_accept': {
+      if (!guardVersion(ws, msg, room)) return;
+      const swap = room.swaps.get(String(msg.swapId || ''));
+      if (!swap) return sendError(ws, '换位邀请不存在或已失效', 'NO_SWAP', room);
+      if (swap.toId !== pid) {
+        return sendError(ws, '只有被邀请人可以接受换位邀请', 'FORBIDDEN', room);
+      }
+      // 接受前重新校验：双方必须仍处在邀请发起时记录的位置
+      const stillInPlace =
+        room.order[swap.fromPos] === swap.fromId && room.order[swap.toPos] === swap.toId;
+      if (!stillInPlace) {
+        // 校验失败：邀请标记失效，队列保持不变
+        invalidateSwap(room, swap, '队列位置已变化');
+        return commit(room);
+      }
+      // 校验通过与交换在同一同步块内完成，天然原子
+      room.order[swap.fromPos] = swap.toId;
+      room.order[swap.toPos] = swap.fromId;
+      room.swaps.delete(swap.id);
+      const fromNick = room.participants.get(swap.fromId)?.nick ?? '已离开';
+      addLog(
+        room,
+        'swap',
+        `「${fromNick}」与「${me.nick}」交换了发言位置（第 ${swap.fromPos + 1} ↔ 第 ${swap.toPos + 1} 位）`
+      );
       return commit(room);
     }
   }

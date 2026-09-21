@@ -4,6 +4,7 @@
 
 - 创建者一键生成 **6 位房间码**，即主持人；
 - 参与者用**昵称加入**，自行**申请 / 取消发言**；
+- 排队者之间可**协商换位**：发起邀请、对方接受/拒绝，位置原子交换，冲突自动失效；
 - 主持人可**拖动排序**、**开始 / 结束发言**、将成员移出队列、**一键清空**；
 - 大屏展示当前发言人、大号**发言计时**、发言队列、在场成员与**操作记录**；
 - 弱网/刷新/休眠后**自动断线重连**，恢复一致的队列顺序与当前发言计时；
@@ -71,6 +72,7 @@ npm test
 | `WS_PATH` | `/ws` | WebSocket 挂载路径 |
 | `ROOM_TTL_MS` | `14400000`（4 小时） | 房间内**所有人离线**后，房间保留多久再回收 |
 | `LOG_LIMIT` | `500` | 服务端保留的操作记录最大条数（超出滚动淘汰） |
+| `SWAP_RESOLVED_TTL_MS` | `30000`（30 秒） | 已结束的换位邀请（接受/拒绝/撤回/失效）在房间快照中继续保留的时长，供前端展示操作反馈 |
 
 compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端口可通过
 `docker compose up --build` 前设置 `PORT` 环境变量覆盖。
@@ -91,6 +93,13 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 
 - 输入房间码 + 昵称加入；断线后自动用原身份重连（刷新页面也会恢复席位与队列位置）。
 - 点 **🙋 申请发言** 排入队尾，排队中可随时**取消申请**。
+- **协商换位**：排队后，队列中其他成员条目上会出现 **⇄ 换位** 按钮，点击即向对方
+  发起换位邀请；对方可**接受**或**拒绝**，你也可以在对方回应前**撤回邀请**。
+  - 每人同一时刻最多参与一条待处理邀请；邀请中条目会显示「⇄ 换位邀请/被邀中」标签。
+  - 队列上方分别展示**我发起的**（等待回应/撤回）与**我收到的**（接受/拒绝）邀请卡。
+  - 接受时服务端重新校验双方仍在发起时的原位置，再**原子交换**；
+    若任一方已取消申请、开始发言、被移除、离开，或主持人重排/清空，
+    邀请自动**失效**并在操作记录中注明原因，队列保持不变。
 - 正在发言时无法重复申请；离线成员在队列中会标注「离线」，重连后自动归位。
 
 ### 投屏建议
@@ -108,6 +117,10 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 ```
 { "type": "request_speak",  "version": 12 }
 { "type": "cancel_speak",   "version": 12 }
+{ "type": "swap_invite",    "version": 12, "participantId": "p_xxx" }
+{ "type": "swap_accept",    "version": 12, "swapId": "sw_xxx" }
+{ "type": "swap_reject",    "version": 12, "swapId": "sw_xxx" }
+{ "type": "swap_cancel",    "version": 12, "swapId": "sw_xxx" }
 { "type": "start_speaking", "version": 12, "participantId": "p_xxx" }   // 主持人
 { "type": "end_speaking",   "version": 12 }                             // 主持人
 { "type": "reorder",        "version": 12, "order": ["p_a", "p_b"] }    // 主持人
@@ -115,6 +128,27 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 { "type": "clear",          "version": 12 }                             // 主持人
 { "type": "clear_logs",     "version": 12 }                             // 主持人
 ```
+
+换位邀请记录随房间快照的 `swaps` 字段广播：
+
+```
+{
+  "id": "sw_…", "from": "p_a", "to": "p_b",
+  "version": 12, "fromPos": 0, "toPos": 2,          // 发起时的队列版本与位置（0 基下标）
+  "status": "pending",        // pending | accepted | rejected | cancelled | invalid
+  "reason": null,             // 失效/结束原因，如 reordered、left、position_changed 等
+  "ts": 1726…, "resolvedAt": null
+}
+```
+
+- `swap_invite` 与普通队列命令一样严格校验版本；`swap_accept / swap_reject /
+  swap_cancel` 只要求携带 `version`，不强制版本相等——接受的真正冲突以双方位置
+  重新校验为准，队尾无关变动（版本增长但位置未变）不会使操作失败。
+- 接受时若 `order[fromPos] === from && order[toPos] === to` 不成立，邀请置为
+  `invalid`（`reason: "position_changed"`）且**队列保持不变**；校验通过则在同一
+  次同步状态变更中交换两个下标。
+- 一方取消申请、开始发言、被主持人移除、主动离开，或主持人重排 / 一键清空时，
+  相关待处理邀请统一置为 `invalid` 并在操作记录注明原因（断线保留邀请，重连后可继续）。
 
 - 服务端在 Node 单事件循环中**同步**处理每条命令：校验 `version === 当前版本`
   后立即修改状态、`version += 1`，并向房间内所有连接广播快照——整个过程不可被其他命令插入。
@@ -133,7 +167,7 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 
 ```
 .
-├── server.js          # Express + WebSocket 服务端（房间、版本化命令、记录、重连）
+├── server.js          # Express + WebSocket 服务端（房间、版本化命令、协商换位、记录、重连）
 ├── public/
 │   ├── index.html     # 首页与房间视图
 │   ├── style.css      # 投屏优化样式

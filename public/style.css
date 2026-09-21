@@ -411,6 +411,62 @@ input[type="text"]:focus {
   border: 1px solid var(--border);
 }
 
+/* ===== 协商换位 ===== */
+.swap-tag {
+  font-size: 12px;
+  background: rgba(167, 139, 250, 0.18);
+  color: var(--accent);
+  border: 1px solid rgba(167, 139, 250, 0.55);
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.swap-invite-btn.is-disabled {
+  opacity: 0.4;
+}
+
+.swap-bar {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  flex-shrink: 0;
+}
+
+body.role-participant .swap-bar { display: flex; }
+
+.swap-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 15px;
+  animation: pop 0.2s ease;
+}
+
+.swap-card.swap-out { border-color: rgba(148, 163, 184, 0.5); }
+.swap-card.swap-in {
+  border-color: rgba(167, 139, 250, 0.7);
+  box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.15);
+}
+
+.swap-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.swap-card-title { font-weight: 700; color: var(--text); }
+.swap-card-desc { color: var(--text-dim); font-size: 14px; word-break: break-all; }
+.swap-card-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
 .queue-empty {
   flex: 1;
   display: flex;
@@ -465,6 +521,7 @@ input[type="text"]:focus {
 .log-item.kind-queue { color: var(--text-dim); }
 .log-item.kind-system { color: var(--accent); }
 .log-item.kind-presence { color: #7dd3fc; }
+.log-item.kind-swap { color: #c4b5fd; }
 
 .people-item {
   display: flex;
@@ -527,6 +584,7 @@ body.role-participant #stage-actions-host { display: none; }
 
 .toast.error { border-color: var(--danger); color: #fecaca; }
 .toast.success { border-color: var(--success); color: #bbf7d0; }
+.toast.info { border-color: var(--accent); color: #ddd6fe; }
 
 @keyframes toast-in {
   from { transform: translateY(-10px); opacity: 0; }

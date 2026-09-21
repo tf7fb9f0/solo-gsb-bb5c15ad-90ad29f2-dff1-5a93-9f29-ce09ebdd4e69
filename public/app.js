@@ -16,7 +16,10 @@ const state = {
   reconnectDelay: 500,
   reconnectTimer: null,
   clockOffset: 0, // 服务端时钟 - 本地时钟
-  timerHandle: null
+  timerHandle: null,
+  // 换位邀请：swapId -> 最近已知状态（用于检测状态变化并弹出反馈）
+  swapSeeded: false,
+  swapStatus: new Map()
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -49,6 +52,7 @@ const els = {
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
   queueCount: $('#queue-count'),
+  swapBar: $('#swap-bar'),
   btnRequest: $('#btn-request'),
   btnCancel: $('#btn-cancel'),
   logList: $('#log-list'),
@@ -195,6 +199,8 @@ function enterRoom(creds) {
   state.me = null;
   state.snapshot = null;
   state.version = 0;
+  state.swapSeeded = false;
+  state.swapStatus = new Map();
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -294,6 +300,9 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'joined': {
       state.me = msg.you;
+      // 首次快照只播种状态，不把重连前已存在的邀请当成新变化弹提示
+      state.swapSeeded = false;
+      state.swapStatus = new Map();
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -340,7 +349,72 @@ function applySnapshot(snap) {
   state.version = snap.version;
   state.clockOffset = snap.serverTs - Date.now();
   els.versionBadge.textContent = `v${snap.version}`;
+  processSwaps(snap);
   render();
+}
+
+// ---------------------------------------------------------------------------
+// 协商换位：状态变化反馈
+// ---------------------------------------------------------------------------
+
+function nickOf(snap, id) {
+  const p = snap.participants.find((x) => x.id === id);
+  return p ? p.nick : '已离开';
+}
+
+function swapOutcomeToast(snap, swap, prevStatus) {
+  if (swap.status === 'pending') {
+    if (state.me && swap.to === state.me.id && !prevStatus) {
+      return [`「${nickOf(snap, swap.from)}」邀请你交换发言位置（第 ${swap.fromPos + 1} ↔ 第 ${swap.toPos + 1} 位）`, 'info'];
+    }
+    return null;
+  }
+  if (swap.status === 'accepted') {
+    return [`换位成功：「${nickOf(snap, swap.from)}」与「${nickOf(snap, swap.to)}」已交换位置`, 'success'];
+  }
+  if (swap.status === 'rejected') {
+    if (state.me && swap.from === state.me.id) {
+      return [`「${nickOf(snap, swap.to)}」拒绝了你的换位邀请`, 'error'];
+    }
+    return ['换位邀请已拒绝', 'info'];
+  }
+  if (swap.status === 'cancelled') {
+    if (state.me && swap.to === state.me.id) {
+      return [`「${nickOf(snap, swap.from)}」撤回了换位邀请`, 'info'];
+    }
+    return ['换位邀请已撤回', 'info'];
+  }
+  if (swap.status === 'invalid') {
+    const reasonText = {
+      canceled_speak: '一方取消了发言申请',
+      started_speaking: '一方开始发言',
+      removed: '一方被移出队列',
+      left: '一方离开了房间',
+      reordered: '主持人调整了发言顺序',
+      cleared: '主持人清空了队列',
+      position_changed: '双方位置已变化'
+    }[swap.reason] || '邀请已失效';
+    return [`换位邀请已失效：${reasonText}`, 'error'];
+  }
+  return null;
+}
+
+function processSwaps(snap) {
+  const seen = new Set();
+  for (const swap of snap.swaps || []) {
+    seen.add(swap.id);
+    const prev = state.swapStatus.get(swap.id);
+    if (state.swapSeeded && (!prev || prev.status !== swap.status)) {
+      const outcome = swapOutcomeToast(snap, swap, prev ? prev.status : null);
+      if (outcome) toast(outcome[0], outcome[1]);
+    }
+    state.swapStatus.set(swap.id, { status: swap.status, reason: swap.reason });
+  }
+  // 清理已从快照消失（过期回收）的本地记录
+  for (const id of [...state.swapStatus.keys()]) {
+    if (!seen.has(id)) state.swapStatus.delete(id);
+  }
+  state.swapSeeded = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +426,7 @@ function render() {
   if (!snap) return;
   renderStage(snap);
   renderQueue(snap);
+  renderSwapBar(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -394,6 +469,10 @@ function renderQueue(snap) {
   els.queueEmpty.classList.toggle('hidden', snap.order.length > 0);
   els.queueList.classList.toggle('hidden', snap.order.length === 0);
 
+  const myId = state.me ? state.me.id : null;
+  const isHost = !!(state.me && state.me.host);
+  const myPending = myId ? (snap.swaps || []).find((s) => s.status === 'pending' && (s.from === myId || s.to === myId)) : null;
+
   snap.order.forEach((pid, i) => {
     const p = pmap.get(pid);
     const nick = p ? p.nick : '已离开';
@@ -403,14 +482,35 @@ function renderQueue(snap) {
     if (state.me && pid === state.me.id) li.classList.add('is-me');
     if (drag && drag.item.dataset.id === pid) li.classList.add('dragging');
 
-    const isHost = state.me && state.me.host;
+    const pendingHere = (snap.swaps || []).find(
+      (s) => s.status === 'pending' && (s.from === pid || s.to === pid)
+    );
+    let swapTag = '';
+    if (pendingHere) {
+      const otherId = pendingHere.from === pid ? pendingHere.to : pendingHere.from;
+      const role = pendingHere.from === pid ? '邀请' : '被邀';
+      swapTag = `<span class="swap-tag" title="${role}换位：与「${escapeHtml(nickOf(snap, otherId))}」">⇄ 换位${role}中</span>`;
+    }
+
+    // 参与者：对队列中其他人可发起换位邀请；自己有待处理邀请或对方已有邀请时禁用
+    let swapInviteBtn = '';
+    if (!isHost && pid !== myId) {
+      const busy = !!myPending || !!pendingHere;
+      swapInviteBtn = `
+        <button class="btn btn-ghost btn-mini swap-invite-btn ${busy ? 'is-disabled' : ''}"
+                data-act="swap-invite" ${busy ? 'disabled' : ''}
+                title="${busy ? '存在待处理的换位邀请' : `邀请「${escapeHtml(nick)}」交换位置`}">⇄ 换位</button>`;
+    }
+
     li.draggable = false; // 使用自定义 pointer 拖拽，同时兼容触屏
     li.innerHTML = `
       <span class="drag-handle ${isHost ? '' : 'hidden'}" title="拖动排序">⠿</span>
       <span class="queue-index">${i + 1}</span>
       <span class="queue-nick">${escapeHtml(nick)}</span>
       ${state.me && pid === state.me.id ? '<span class="me-tag">我</span>' : ''}
+      ${swapTag}
       ${p && !p.online ? '<span class="offline-tag">离线</span>' : ''}
+      ${swapInviteBtn}
       ${isHost ? `
         <button class="btn btn-primary btn-mini" data-act="start" title="请其发言">▶ 开始</button>
         <button class="btn btn-ghost btn-mini" data-act="remove" title="移出队列">✕</button>
@@ -437,6 +537,51 @@ function renderQueue(snap) {
     els.btnCancel.classList.toggle('hidden', !inQueue);
     els.btnRequest.disabled = speaking;
     els.btnRequest.textContent = speaking ? '你正在发言中' : '🙋 申请发言';
+  }
+}
+
+/**
+ * 协商换位状态卡：分别展示「我发起的」与「我收到的」待处理邀请，
+ * 提供接受 / 拒绝 / 撤回操作。普通参与者视图可见。
+ */
+function renderSwapBar(snap) {
+  els.swapBar.textContent = '';
+  if (!state.me || state.me.host) return;
+
+  const myId = state.me.id;
+  const pending = (snap.swaps || []).filter((s) => s.status === 'pending');
+  const outgoing = pending.filter((s) => s.from === myId);
+  const incoming = pending.filter((s) => s.to === myId);
+
+  for (const swap of outgoing) {
+    const card = document.createElement('div');
+    card.className = 'swap-card swap-out';
+    card.innerHTML = `
+      <div class="swap-card-main">
+        <span class="swap-card-title">⇄ 换位邀请已发出</span>
+        <span class="swap-card-desc">等待「${escapeHtml(nickOf(snap, swap.to))}」回应
+          （第 ${swap.fromPos + 1} 位 ↔ 第 ${swap.toPos + 1} 位）</span>
+      </div>
+      <button class="btn btn-ghost btn-mini" data-swap-act="cancel" data-swap-id="${swap.id}">撤回邀请</button>
+    `;
+    els.swapBar.appendChild(card);
+  }
+
+  for (const swap of incoming) {
+    const card = document.createElement('div');
+    card.className = 'swap-card swap-in';
+    card.innerHTML = `
+      <div class="swap-card-main">
+        <span class="swap-card-title">⇄ 收到换位邀请</span>
+        <span class="swap-card-desc">「${escapeHtml(nickOf(snap, swap.from))}」想与你交换位置
+          （第 ${swap.fromPos + 1} 位 ↔ 第 ${swap.toPos + 1} 位）</span>
+      </div>
+      <div class="swap-card-actions">
+        <button class="btn btn-primary btn-mini" data-swap-act="accept" data-swap-id="${swap.id}">接受</button>
+        <button class="btn btn-ghost btn-mini" data-swap-act="reject" data-swap-id="${swap.id}">拒绝</button>
+      </div>
+    `;
+    els.swapBar.appendChild(card);
   }
 }
 
@@ -499,7 +644,7 @@ els.btnClearLogs.addEventListener('click', () => {
   sendCmd({ type: 'clear_logs' });
 });
 
-// 队列条目：开始发言 / 移出
+// 队列条目：开始发言 / 移出 / 发起换位邀请
 els.queueList.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
@@ -509,7 +654,21 @@ els.queueList.addEventListener('click', (e) => {
     sendCmd({ type: 'start_speaking', participantId: pid });
   } else if (btn.dataset.act === 'remove') {
     sendCmd({ type: 'remove', participantId: pid });
+  } else if (btn.dataset.act === 'swap-invite') {
+    if (btn.disabled) return;
+    sendCmd({ type: 'swap_invite', participantId: pid });
   }
+});
+
+// 换位状态卡：接受 / 拒绝 / 撤回
+els.swapBar.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-swap-act]');
+  if (!btn) return;
+  const swapId = btn.dataset.swapId;
+  const act = btn.dataset.swapAct;
+  if (act === 'accept') sendCmd({ type: 'swap_accept', swapId });
+  else if (act === 'reject') sendCmd({ type: 'swap_reject', swapId });
+  else if (act === 'cancel') sendCmd({ type: 'swap_cancel', swapId });
 });
 
 // ---------------------------------------------------------------------------
